@@ -486,12 +486,11 @@ class EmailAdapter(BasePlatformAdapter):
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
-        # Highest numeric UID present at startup. Under BODY.PEEK[] polling,
-        # fetched messages stay UNSEEN, so without this floor a restart in a
-        # large (>_seen_uids_max) inbox could replay old mail dropped by
-        # _trim_seen_uids (#60637). UIDs are monotonic, so any UID above this
-        # watermark arrived after connect() and is genuinely new.
-        self._startup_uid_watermark: Optional[int] = None
+        # Highest UID known to be consumed in the current UIDVALIDITY epoch.
+        # BODY.PEEK[] leaves fetched messages UNSEEN, so this durable-in-process
+        # boundary prevents replay after _seen_uids evicts older entries.
+        self._uid_watermark: Optional[int] = None
+        self._uidvalidity: Optional[int] = None
         self._poll_task: Optional[asyncio.Task] = None
 
         # Map chat_id (sender email) -> last subject + message-id for threading
@@ -536,18 +535,80 @@ class EmailAdapter(BasePlatformAdapter):
         return best
 
     def _seed_seen_uids(self, uids) -> None:
-        """Seed ``_seen_uids`` from existing UIDs and set the startup watermark.
+        """Seed UID state from all messages in the current mailbox epoch.
 
         Called once from ``connect()`` with every UID currently in the mailbox.
         The watermark (highest existing UID) is computed from the *full* set
-        before trimming, so trimming can never lower the replay floor: only
-        mail with a UID above the watermark is processed, which by IMAP UID
-        monotonicity means mail that arrived after startup.
+        before trimming, so trimming can never lower the consumed boundary.
         """
-        for uid in uids:
-            self._seen_uids.add(uid)
-        self._startup_uid_watermark = self._max_uid(self._seen_uids)
+        uid_list = list(uids)
+        self._seen_uids = set(uid_list)
+        self._uid_watermark = self._max_uid(uid_list)
         self._trim_seen_uids()
+
+    def _record_consumed_uid(self, uid) -> None:
+        """Record a UID as consumed and advance the replay boundary."""
+        try:
+            numeric_uid = int(uid)
+        except (TypeError, ValueError):
+            numeric_uid = None
+        if numeric_uid is not None and (
+            self._uid_watermark is None or numeric_uid > self._uid_watermark
+        ):
+            self._uid_watermark = numeric_uid
+        self._seen_uids.add(uid)
+        if len(self._seen_uids) > self._seen_uids_max:
+            self._trim_seen_uids()
+
+    @staticmethod
+    def _read_uidvalidity(imap) -> Optional[int]:
+        """Return the selected mailbox's UIDVALIDITY, when advertised."""
+        try:
+            response = imap.response("UIDVALIDITY")
+        except Exception:
+            return None
+        if not isinstance(response, (tuple, list)) or len(response) < 2:
+            return None
+        values = response[1]
+        if not isinstance(values, (tuple, list)) or not values:
+            return None
+        raw = values[-1]
+        if isinstance(raw, bytes):
+            raw = raw.decode("ascii", errors="ignore")
+        match = re.search(r"\d+", str(raw))
+        return int(match.group(0)) if match else None
+
+    def _sync_uidvalidity(self, imap) -> bool:
+        """Reset and reseed UID state when the mailbox epoch changes."""
+        current = self._read_uidvalidity(imap)
+        if current is None:
+            return True
+        if self._uidvalidity is None:
+            self._uidvalidity = current
+            return True
+        if current == self._uidvalidity:
+            return True
+
+        status, data = imap.uid("search", None, "ALL")
+        if status != "OK" or not data:
+            logger.warning(
+                "[Email] UIDVALIDITY changed from %s to %s but UID state could not be reseeded",
+                self._uidvalidity,
+                current,
+            )
+            return False
+
+        old_uidvalidity = self._uidvalidity
+        self._uidvalidity = current
+        existing_uids = data[0].split() if data[0] else []
+        self._seed_seen_uids(existing_uids)
+        logger.info(
+            "[Email] UIDVALIDITY changed from %s to %s; reseeded %d existing UIDs",
+            old_uidvalidity,
+            current,
+            len(existing_uids),
+        )
+        return True
 
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
@@ -630,9 +691,10 @@ class EmailAdapter(BasePlatformAdapter):
             _send_imap_id(imap)
             # Mark all existing messages as seen so we only process new ones
             imap.select("INBOX")
+            self._uidvalidity = self._read_uidvalidity(imap)
             status, data = imap.uid("search", None, "ALL")
-            if status == "OK" and data and data[0]:
-                self._seed_seen_uids(data[0].split())
+            if status == "OK" and data:
+                self._seed_seen_uids(data[0].split() if data[0] else [])
             imap.logout()
             logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
         except Exception as e:
@@ -696,28 +758,32 @@ class EmailAdapter(BasePlatformAdapter):
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
                 imap.select("INBOX")
+                if not self._sync_uidvalidity(imap):
+                    return results
 
                 status, data = imap.uid("search", None, "UNSEEN")
                 if status != "OK" or not data or not data[0]:
                     return results
 
-                for uid in data[0].split():
+                uids = data[0].split()
+                try:
+                    uids = sorted(uids, key=int)
+                except (TypeError, ValueError):
+                    pass
+
+                for uid in uids:
                     if uid in self._seen_uids:
                         continue
-                    # Skip mail that already existed at startup. Under
-                    # BODY.PEEK[] fetched messages stay UNSEEN, so without this
-                    # floor a restart in a large (>_seen_uids_max) inbox could
-                    # replay old mail that _trim_seen_uids dropped (#60637).
-                    if self._startup_uid_watermark is not None:
+                    # BODY.PEEK[] leaves consumed mail UNSEEN. Skip anything at
+                    # or below the consumed boundary even if _seen_uids evicted
+                    # it after crossing the bounded-set cap (#60637).
+                    if self._uid_watermark is not None:
                         try:
-                            if int(uid) <= self._startup_uid_watermark:
+                            if int(uid) <= self._uid_watermark:
                                 continue
                         except (TypeError, ValueError):
                             pass
-                    self._seen_uids.add(uid)
-                    # Trim periodically to prevent unbounded memory growth
-                    if len(self._seen_uids) > self._seen_uids_max:
-                        self._trim_seen_uids()
+                    self._record_consumed_uid(uid)
 
                     fetch_cmd = "(BODY.PEEK[])" if self._imap_peek else "(RFC822)"
                     status, msg_data = imap.uid("fetch", uid, fetch_cmd)
@@ -1314,11 +1380,28 @@ def _apply_yaml_config(yaml_cfg: dict, email_cfg: dict) -> Optional[dict]:
     top-level ``platforms.email.imap_peek: false`` would never reach the
     adapter (only a nested ``extra:`` block would). Bridge them here.
     """
+    # Match load_gateway_config() precedence: gateway.platforms is the base,
+    # top-level platforms overrides it, and the legacy direct email block has
+    # final precedence when present. ``email_cfg`` preserves direct calls to
+    # this hook in isolation (including plugin tests).
+    effective: dict = dict(email_cfg) if isinstance(email_cfg, dict) else {}
+    gateway_cfg = yaml_cfg.get("gateway") if isinstance(yaml_cfg, dict) else None
+    gateway_platforms = gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None
+    platforms = yaml_cfg.get("platforms") if isinstance(yaml_cfg, dict) else None
+    sources = (
+        gateway_platforms.get("email") if isinstance(gateway_platforms, dict) else None,
+        platforms.get("email") if isinstance(platforms, dict) else None,
+        yaml_cfg.get("email") if isinstance(yaml_cfg, dict) else None,
+    )
+    for source in sources:
+        if isinstance(source, dict):
+            effective.update(source)
+
     seeded: dict = {}
-    if "imap_peek" in email_cfg:
-        seeded["imap_peek"] = email_cfg["imap_peek"]
-    if "skip_attachments" in email_cfg:
-        seeded["skip_attachments"] = email_cfg["skip_attachments"]
+    if "imap_peek" in effective:
+        seeded["imap_peek"] = effective["imap_peek"]
+    if "skip_attachments" in effective:
+        seeded["skip_attachments"] = effective["skip_attachments"]
     return seeded or None
 
 
