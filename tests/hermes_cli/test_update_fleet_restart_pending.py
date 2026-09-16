@@ -17,6 +17,7 @@ No live gateway, no network. Git and restart are mocked.
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -767,3 +768,105 @@ def test_startup_warn_kept_when_receipt_owed_gateway_is_down(monkeypatch, capsys
 
     assert "did not restart running gateways" in capsys.readouterr().err
     assert update_cmd._fleet_restart_pending_marker_path().exists()
+
+
+# ── Multiplexed fleet covers per-profile obligations (served_profiles) ──
+#
+# A receipt written while profiles ran as SEPARATE gateways owes one
+# (gateway, profile) row per profile. After the profiles consolidate into ONE
+# multiplexed gateway, the fleet matrix still emits a single row keyed by the
+# home profile (a served profile writes no identity files of its own), so the
+# owed (gateway, <served profile>) could never be covered again — the marker
+# never discharged and every CLI startup printed the false "did not restart
+# running gateways" warning. A row must vouch for every profile its gateway
+# process declares it serves.
+
+
+def _multiplex_env(monkeypatch, tmp_path, served_profiles):
+    """Real receipt + marker + state files; the REAL fleet probe reads them.
+
+    Environment seams only (same bar as test_fleet_matrix_down_state.py):
+    code identity, profile roots, socket identify, home gateway resolver.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    # Receipt from the update that ran while each profile had its own gateway.
+    (receipts / "latest.json").write_text(json.dumps({
+        "schema": 2,
+        "plan": {"runtimes": [
+            {"kind": "gateway", "profile": "default", "pid": 111, "code_sha": "a" * 40},
+            {"kind": "gateway", "profile": "beta", "pid": 222, "code_sha": "a" * 40},
+        ]},
+    }), encoding="utf-8")
+    # One multiplexed gateway on the default home, current at the new sha.
+    (home / "gateway_state.json").write_text(json.dumps({
+        "pid": os.getpid(), "kind": "hermes-gateway",
+        "argv": ["python", "hermes_cli/main.py", "gateway", "run"],
+        "start_time": 0, "hermes_home": str(home), "profile": "default",
+        "gateway_state": "running",
+        "code_sha": "b" * 40, "code_version": "0.21.3-test",
+        **({} if served_profiles is None else {"served_profiles": list(served_profiles)}),
+    }), encoding="utf-8")
+    (home / "fleet_restart_pending").write_text(
+        f"started=1000000.0\npid=333\nexpected_sha={'b' * 40}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.build_info.get_code_identity",
+        lambda refresh=False: {"sha": "b" * 40, "version": "0.21.3-test"},
+    )
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles"
+    )
+    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda h, **k: None)
+    monkeypatch.setattr(
+        "gateway.status.live_gateway_pid_for_home", lambda h: os.getpid()
+    )
+    # One home for everything: marker, receipt, and state file all resolve via
+    # get_hermes_home() (HERMES_HOME env), not via the profile-root seams.
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def test_multiplexed_fleet_discharges_marker(monkeypatch, tmp_path):
+    """Owed (gateway, beta) is covered by the multiplexed row's served set."""
+    home = _multiplex_env(monkeypatch, tmp_path, served_profiles=["default", "beta"])
+    _patch_marker_sha(monkeypatch, "b" * 40)
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is False
+    assert not (home / "fleet_restart_pending").exists()
+
+
+def test_multiplexed_fleet_discharges_marker_via_receipt_path(monkeypatch, tmp_path):
+    """Marker already removed by hand: the receipt path must also clear."""
+    home = _multiplex_env(monkeypatch, tmp_path, served_profiles=["default", "beta"])
+    (home / "fleet_restart_pending").unlink()
+    _patch_marker_sha(monkeypatch, "b" * 2 + "c" * 38)
+
+    # Receipt rows recorded OLD shas; the live multiplexed fleet is current at
+    # the checkout sha, so nothing still owes a restart.
+    assert update_cmd_fleet._pending_fleet_restart_needed() is False
+
+
+def test_multiplexed_fleet_without_served_set_keeps_warning(monkeypatch, tmp_path):
+    """No served_profiles declared (pre-stamping gateway or foreign writer):
+    the row cannot vouch for beta, conservatism keeps the warning."""
+    home = _multiplex_env(monkeypatch, tmp_path, served_profiles=None)
+    _patch_marker_sha(monkeypatch, "b" * 40)
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is True
+    assert (home / "fleet_restart_pending").exists()
+
+
+def test_multiplexed_fleet_stale_row_keeps_warning(monkeypatch, tmp_path):
+    """Served set present but the process runs pre-update code: still owes."""
+    home = _multiplex_env(monkeypatch, tmp_path, served_profiles=["default", "beta"])
+    _record = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+    _record["code_sha"] = "a" * 40  # pre-update
+    (home / "gateway_state.json").write_text(json.dumps(_record), encoding="utf-8")
+    _patch_marker_sha(monkeypatch, "b" * 40)
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is True
+    assert (home / "fleet_restart_pending").exists()

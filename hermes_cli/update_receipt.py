@@ -264,14 +264,23 @@ def _socket_identity(home: Path) -> Optional[tuple[int, dict]]:
 
 
 def _fleet_row(
-    profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any, state: str = "unknown"
+    profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any, state: str = "unknown",
+    served_profiles: Any = None,
 ) -> dict[str, Any]:
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
-    return {
+    row: dict[str, Any] = {
         "profile": profile, "pid": pid, "code_sha": str(code_sha) if code_sha else None,
         "code_version": code_version, "state": state,
     }
+    # A multiplexed gateway is one process serving several profiles; the matrix keeps
+    # one row per live gateway (keyed by its home profile), so carry the declared
+    # served set for consumers that reconcile per-profile obligations (restart
+    # coverage, marker discharge). ``None`` (unset) adds no key, keeping rows from
+    # probe paths without the declaration byte-compatible with previous schemas.
+    if isinstance(served_profiles, list):
+        row["served_profiles"] = [str(name) for name in served_profiles if name]
+    return row
 
 
 # Runtime-status states that do not describe a gateway that should be running now — no down row.
@@ -310,7 +319,10 @@ def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> l
             sock = _socket_identity(home)
             if sock is not None:
                 pid, identity = sock
-                row = _fleet_row(profile, pid, identity.get("code_sha"), identity.get("code_version"), expected_sha)
+                row = _fleet_row(
+                    profile, pid, identity.get("code_sha"), identity.get("code_version"), expected_sha,
+                    served_profiles=identity.get("served_profiles"),
+                )
                 results.append({**row, "source": "socket"})
                 continue
             record = read_runtime_status(home / "gateway_state.json")
@@ -325,7 +337,10 @@ def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> l
             # verifies that same live gateway.
             if live_gateway_pid_for_home(home) == pid:
                 results.append(
-                    _fleet_row(profile, pid, record.get("code_sha"), record.get("code_version"), expected_sha)
+                    _fleet_row(
+                        profile, pid, record.get("code_sha"), record.get("code_version"), expected_sha,
+                        served_profiles=record.get("served_profiles"),
+                    )
                 )
                 continue
             # A live non-gateway (or a gateway for another profile) can write a

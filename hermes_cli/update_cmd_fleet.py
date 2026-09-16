@@ -13,6 +13,7 @@ import sys
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from hermes_cli.update_cmd_common import _best_effort
 from hermes_cli.update_inventory import _gateway_service_matches_profile
@@ -171,12 +172,37 @@ def _receipt_owed_gateways() -> set[tuple[str, str]] | None:
     return owed
 
 
+def _fleet_row_identities(row: Mapping[str, object]) -> set[str]:
+    """Profile identities a fleet row can vouch for.
+
+    A multiplexed gateway is ONE process serving several profiles, but the
+    fleet matrix emits one row per live gateway keyed by its home profile
+    (``_profile_homes``); a served profile writes no identity files of its
+    own (gateway/status.py: "a served profile writes no identity files of
+    its own"). The gateway declares the full set in its control-socket
+    ``identify`` answer and its ``gateway_state.json`` record
+    (``served_profiles``), so the row can vouch for every profile that
+    process serves — same code identity, same restart.
+    """
+    identities = {row.get("profile")}
+    served = row.get("served_profiles")
+    if isinstance(served, list):
+        identities.update(str(name) for name in served if name)
+    return {str(name) for name in identities if name and name != "unknown"}
+
+
 def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
     """Require current successors for every recorded runtime, not just any live row.
 
     A PID changes on restart; the stable identity is (runtime kind, profile).
     The gateway matrix cannot vouch for serve/dashboard or unidentified runtimes.
     Keep the historical receipt intact: a manual restart is not a successful update.
+
+    Multiplexed gateways: a row vouches for every profile its process serves
+    (``served_profiles``), not just its home profile — otherwise an owed
+    ``(gateway, profile)`` from a receipt written before the profiles
+    consolidated into one multiplexed gateway could never be covered again
+    and the restart-pending warning would never clear.
     """
     if not expected_sha:
         return False
@@ -192,7 +218,7 @@ def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
             for row in fleet
         ):
             return False
-        return owed <= {("gateway", row.get("profile")) for row in fleet}
+        return owed <= {("gateway", name) for row in fleet for name in _fleet_row_identities(row)}
     except Exception as exc:
         logger.debug("Could not reconcile pending fleet identities: %s", exc)
         return False
@@ -255,7 +281,9 @@ def _marker_only_restart_obsolete() -> bool:
             return False  # unidentified runtime: the matrix cannot vouch for it
         if row.get("state") != "current" or str(row.get("code_sha")) != expected_sha:
             return False  # stale / down / unknown-identity row still owes the restart
-    if owed is None or not owed <= {("gateway", row.get("profile")) for row in fleet}:
+    if owed is None or not owed <= {
+        ("gateway", name) for row in fleet for name in _fleet_row_identities(row)
+    }:
         return False  # a gateway the receipt owes is absent (down) or unidentifiable
     _clear_fleet_restart_pending_marker()
     logger.debug(
