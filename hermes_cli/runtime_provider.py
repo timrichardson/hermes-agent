@@ -359,13 +359,71 @@ def _cfg_provider(model_cfg: dict[str, Any]) -> str:
     return str(model_cfg.get("provider") or "").strip().lower()
 
 
+def _provider_supports_config_base_url_override(
+    provider: str,
+    cfg_base_url: str,
+    default_base_url: str,
+) -> bool:
+    """Return whether a configured endpoint is safe for a built-in provider.
+
+    ``model.base_url`` is global and can survive a provider switch. Matching only
+    ``model.provider`` is therefore insufficient: a switch can leave the previous
+    provider's stock endpoint paired with the new provider. Preserve intentional
+    proxy overrides, but reject another registered provider's canonical endpoint.
+    """
+    provider_norm = (provider or "").strip().lower()
+    cfg_base_url = (cfg_base_url or "").strip()
+    default_base_url = (default_base_url or "").strip()
+    if not cfg_base_url:
+        return False
+
+    cfg_host = base_url_hostname(cfg_base_url)
+    if not cfg_host:
+        return False
+    current_host = base_url_hostname(default_base_url)
+    if current_host and cfg_host == current_host:
+        return True
+    # A loopback endpoint is an explicit local proxy/relay, not another vendor's
+    # stock cloud route; preserve the existing local-development override.
+    if _loopback_hostname(cfg_host):
+        return True
+
+    # These provider IDs intentionally share endpoint families.
+    compatible_providers = {provider_norm}
+    if provider_norm in {"minimax", "minimax-cn"}:
+        compatible_providers.update({"minimax", "minimax-cn"})
+
+    other_default_hosts = {
+        base_url_hostname(pconfig.inference_base_url)
+        for provider_id, pconfig in PROVIDER_REGISTRY.items()
+        if provider_id not in compatible_providers and getattr(pconfig, "inference_base_url", "")
+    }
+    other_default_hosts.update(
+        base_url_hostname(url)
+        for url in (
+            OPENROUTER_BASE_URL,
+            DEFAULT_CODEX_BASE_URL,
+            DEFAULT_QWEN_BASE_URL,
+            DEFAULT_XAI_OAUTH_BASE_URL,
+        )
+        if url
+    )
+    other_default_hosts.discard("")
+    return cfg_host not in other_default_hosts
+
+
 def _config_base_url_for_provider(model_cfg: dict[str, Any], provider: str) -> str:
-    """``model.base_url`` (stripped, no trailing slash) only when ``model.provider`` is
-    ``provider`` — a stale base_url must not leak into another provider."""
+    """Return a trusted ``model.base_url`` for the selected provider only."""
     configured_provider = _cfg_provider(model_cfg)
     if provider == "actual":
         configured_provider = _models.normalize_provider(configured_provider)
-    return str(model_cfg.get("base_url") or "").strip().rstrip("/") if _same_registered_provider(provider, configured_provider) else ""
+    if not _same_registered_provider(provider, configured_provider):
+        return ""
+    cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    return cfg_base_url if _provider_supports_config_base_url_override(
+        provider, cfg_base_url, getattr(pconfig, "inference_base_url", "") if pconfig else ""
+    ) else ""
 
 
 def is_foreign_provider_endpoint(provider: Optional[str], base_url: Optional[str]) -> bool:
